@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DB_PATH=/data/task_state.db
+      - OLLAMA_URL=http://ollama:11434
+      - MOCK_MODE=true
+      - LOG_LEVEL=info

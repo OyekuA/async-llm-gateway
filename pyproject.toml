@@ -1,0 +1,20 @@
+[project]
+name = "async-llm-gateway"
+version = "0.1.0"
+description = "Async LLM Gateway"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "celery[redis]",
+    "httpx",
+    "matplotlib",
+    "redis",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
