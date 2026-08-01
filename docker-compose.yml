@@ -19,6 +19,11 @@ services:
       - OLLAMA_URL=http://ollama:11434
       - MOCK_MODE=true
       - LOG_LEVEL=info
+    volumes:
+      - task_data:/data
     depends_on:
       redis:
         condition: service_healthy
+
+volumes:
+  task_data:
