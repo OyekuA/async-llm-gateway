@@ -17,8 +17,5 @@ dependencies = [
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["main"]
-
 [tool.setuptools.packages.find]
-include = ["common*"]
+include = ["api*", "common*"]

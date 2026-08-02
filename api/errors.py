@@ -1,0 +1,2 @@
+class InfrastructureUnavailable(RuntimeError):
+    pass
