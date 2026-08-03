@@ -1,0 +1,8 @@
+.git/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+.env
+benchmark/results.json
+test_*.py
