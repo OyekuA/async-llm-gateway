@@ -21,7 +21,7 @@ async def generate(body: GenerateRequest, request: Request) -> GenerateResponse:
 
     task_id = str(uuid.uuid4())
     created_at = datetime.datetime.now(datetime.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%fZ"
+        "%Y-%m-%dT%H:%M:%S.%fZ"
     )
 
     conn = await get_connection_async()
