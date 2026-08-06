@@ -2,7 +2,7 @@ import os
 from typing import Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 DEFAULT_VALID_MODELS = "tinyllama,llama3,llama3:8b"
 
@@ -20,10 +20,24 @@ class GenerateRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=256, ge=1, le=4096)
     model: Optional[str] = Field(default="tinyllama")
 
+    @field_validator("prompt")
+    @classmethod
+    def _prompt_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("prompt must not be empty or whitespace-only")
+        return value
+
+    @field_validator("temperature", "max_tokens", "model", mode="before")
+    @classmethod
+    def _null_to_default(cls, value: object, info: ValidationInfo) -> object:
+        if value is None:
+            return cls.model_fields[info.field_name].default
+        return value
+
     @field_validator("model")
     @classmethod
-    def _validate_model(cls, value: Optional[str]) -> Optional[str]:
-        if value is None or os.environ.get("MOCK_MODE", "true") == "true":
+    def _validate_model(cls, value: str) -> str:
+        if os.environ.get("MOCK_MODE", "true") == "true":
             return value
         allowed = _valid_models()
         if value not in allowed:

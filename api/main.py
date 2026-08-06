@@ -1,5 +1,3 @@
-import datetime
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -10,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from common.database import DB_PATH, get_connection_async
+from common.logging import setup_logging
 from .errors import InfrastructureUnavailable
 from .routes import generate, status, sync_generate
 
@@ -20,35 +19,7 @@ logger = logging.getLogger("api")
 
 redis_client = None
 
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.datetime.fromtimestamp(record.created, datetime.timezone.utc)
-        payload = {
-            "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "logger": record.name,
-        }
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, default=str)
-
-
-def setup_logging() -> None:
-    level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(level)
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        lg = logging.getLogger(name)
-        lg.handlers = [handler]
-        lg.propagate = False
-
-
-setup_logging()
+setup_logging(LOG_LEVEL, ("uvicorn", "uvicorn.error", "uvicorn.access"))
 
 
 async def _db_connected() -> bool:
