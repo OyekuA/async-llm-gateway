@@ -2,4 +2,6 @@ __pycache__/
 *.db
 .env
 benchmark/results.json
+benchmark/run.sh
+benchmark/run.bat
 *.egg-info/
