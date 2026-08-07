@@ -1,4 +1,5 @@
 import datetime
+import logging
 import uuid
 
 from fastapi import APIRouter, Request
@@ -8,10 +9,22 @@ from common.database import (
     execute_with_retry_async,
     get_connection_async,
 )
+from ..celery_app import app as celery_app
 from ..errors import InfrastructureUnavailable
 from ..models import GenerateRequest, GenerateResponse
 
 router = APIRouter()
+
+logger = logging.getLogger("api.routes.generate")
+
+
+def _enqueue_task(task_id: str) -> None:
+    try:
+        celery_app.send_task("worker.tasks.run_inference", args=[task_id])
+    except Exception:
+        logger.warning(
+            "Redis unreachable; task %s left QUEUED in SQLite", task_id, exc_info=True
+        )
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
@@ -47,5 +60,7 @@ async def generate(body: GenerateRequest, request: Request) -> GenerateResponse:
         await commit_with_retry_async(conn)
     finally:
         await conn.close()
+
+    _enqueue_task(task_id)
 
     return GenerateResponse(task_id=task_id, status_url=f"/status/{task_id}")
