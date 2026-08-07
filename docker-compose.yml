@@ -9,6 +9,22 @@ services:
       timeout: 3s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU passthrough requires nvidia-container-toolkit on the host.
+    # On CPU-only hosts, remove the "runtime: nvidia" line (or use a compose override).
+    runtime: nvidia
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   api:
     build: .
     healthcheck:
@@ -24,6 +40,8 @@ services:
       - DB_PATH=/data/task_state.db
       - OLLAMA_URL=http://ollama:11434
       - MOCK_MODE=true
+      - DEFAULT_MODEL=tinyllama
+      - MODEL_PULL_TIMEOUT=600
       - LOG_LEVEL=info
     volumes:
       - task_data:/data
@@ -38,6 +56,8 @@ services:
       - DB_PATH=/data/task_state.db
       - OLLAMA_URL=http://ollama:11434
       - MOCK_MODE=true
+      - DEFAULT_MODEL=tinyllama
+      - MODEL_PULL_TIMEOUT=600
       - LOG_LEVEL=info
     volumes:
       - task_data:/data
@@ -46,8 +66,11 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     command: >
       celery -A worker.celery_app worker --concurrency=4 --pool=prefork --loglevel=info
 
 volumes:
   task_data:
+  ollama_data:
