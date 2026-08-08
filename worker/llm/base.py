@@ -18,5 +18,7 @@ class LLMBackendError(Exception):
 
 class AbstractLLMBackend(ABC):
     @abstractmethod
-    def generate(self, prompt: str, temperature: float, max_tokens: int) -> GenerateResult:
+    def generate(
+        self, prompt: str, temperature: float, max_tokens: int, model: str
+    ) -> GenerateResult:
         raise NotImplementedError

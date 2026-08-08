@@ -12,7 +12,9 @@ from .llm import LLMBackendError, get_backend
 
 logger = logging.getLogger("worker.tasks")
 
-_SELECT_TASK_SQL = "SELECT prompt, temperature, max_tokens FROM tasks WHERE task_id = ?"
+_SELECT_TASK_SQL = (
+    "SELECT prompt, temperature, max_tokens, model FROM tasks WHERE task_id = ?"
+)
 _CLAIM_SQL = (
     "UPDATE tasks SET status='PROCESSING', started_at=? "
     "WHERE task_id=? AND status='QUEUED'"
@@ -77,7 +79,9 @@ def run_inference(self, task_id: str):
         commit_with_retry(conn)
 
         try:
-            result = get_backend().generate(row["prompt"], temperature, max_tokens)
+            result = get_backend().generate(
+                row["prompt"], temperature, max_tokens, row["model"]
+            )
         except LLMBackendError as exc:
             _mark_failure(conn, task_id, str(exc), int(exc.retryable))
             return

@@ -14,11 +14,13 @@ _client = httpx.Client(timeout=300.0)
 
 class OllamaBackend(AbstractLLMBackend):
     def __init__(self) -> None:
-        self.model = os.environ.get("DEFAULT_MODEL", "tinyllama")
+        self.default_model = os.environ.get("DEFAULT_MODEL", "tinyllama")
 
-    def generate(self, prompt: str, temperature: float, max_tokens: int) -> GenerateResult:
+    def generate(
+        self, prompt: str, temperature: float, max_tokens: int, model: str
+    ) -> GenerateResult:
         payload = {
-            "model": self.model,
+            "model": model or self.default_model,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": temperature, "num_predict": max_tokens},

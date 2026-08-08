@@ -9,7 +9,9 @@ class MockBackend(AbstractLLMBackend):
     def __init__(self) -> None:
         self._failure_rate = float(os.environ.get("MOCK_FAILURE_RATE", "0.0"))
 
-    def generate(self, prompt: str, temperature: float, max_tokens: int) -> GenerateResult:
+    def generate(
+        self, prompt: str, temperature: float, max_tokens: int, model: str
+    ) -> GenerateResult:
         if random.random() < self._failure_rate:
             raise LLMBackendError("Simulated OOM", retryable=False)
 

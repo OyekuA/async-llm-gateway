@@ -44,5 +44,6 @@ logger.info("Redis reachable at %s", REDIS_URL)
 
 init_db()
 logger.info("Database ready at %s", DB_PATH)
-logger.info("Using backend: %s", "mock" if MOCK_MODE else "ollama")
+if MOCK_MODE:
+    logger.info("Using backend: mock")
 

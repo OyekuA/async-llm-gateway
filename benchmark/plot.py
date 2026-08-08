@@ -81,6 +81,7 @@ def plot_results(datasets, output):
     ax_latency.set_title("P99 Latency vs Concurrent Requests")
     ax_latency.set_xlabel("Concurrent Requests")
     ax_latency.set_ylabel("P99 Latency (seconds)")
+    ax_latency.legend()
 
     for ax in (ax_drop, ax_latency):
         ax.grid(visible=True, alpha=0.35)
