@@ -6,7 +6,7 @@ FastAPI, Celery, Redis, SQLite
 
 **Solution:** Engineered a non-blocking API gateway. Offloaded payloads into a Redis-backed Celery queue for asynchronous background processing.
 
-**Impact:** Eliminated thread starvation. Sustained predictable scaling during heavy traffic spikes. Zero dropped connections.
+**Impact:** Inference is fully off the request path: the API returns `202` after a single indexed SQLite insert, regardless of backend load. A ramped-concurrency benchmark (10-500) measures drop rate, P50/P95/P99 latency, and throughput for both the async path and a synchronous baseline. Results are produced by running the included benchmark (see Benchmarking).
 
 ---
 
@@ -14,11 +14,11 @@ FastAPI, Celery, Redis, SQLite
 
 This repository implements a containerized asynchronous gateway for LLM inference. It separates request acceptance from model execution. A client submits a prompt and receives a `task_id` immediately. Background workers perform the inference and persist the result to SQLite. The client polls a status endpoint until the task reaches a terminal state.
 
-The gateway is built on four containers. FastAPI accepts HTTP requests. Redis transports task identifiers between the API and a Celery worker pool. SQLite stores the full task state machine. Ollama (or a deterministic mock backend) executes the model call.
+The gateway is built on four containers. FastAPI accepts HTTP requests. Redis transports task identifiers between the API and a Celery worker pool. SQLite stores the full task state machine. Ollama (or a stochastic mock backend) executes the model call.
 
-A synchronous baseline endpoint ships alongside the async path. Both live in the same uvicorn process, so the only difference between them is the queuing architecture. The benchmark suite compares the two under identical load profiles. It measures drop rate, latency percentiles, and throughput at five concurrency levels. The async path is expected to hold near-zero drop rate at 500 concurrent requests. The sync path saturates its thread pool and begins dropping requests around 50 concurrent.
+A synchronous baseline endpoint ships alongside the async path. Both ship in the same container image with identical configuration; the only architectural difference is the queuing path. The benchmark suite compares the two under identical load profiles. It measures drop rate, latency percentiles, and throughput at five concurrency levels. The async path is expected to hold near-zero drop rate at 500 concurrent requests. The sync path is expected to saturate its bounded executor thread pool under load; its collapse point is a measured output of the benchmark, not a fixed number.
 
-This project is a system-design study. Every component carries a healthcheck. Every state transition uses an atomic compare-and-swap guard. Every infrastructure failure mode has a documented fallback. The design decisions and their trade-offs are recorded alongside this repository.
+This project is a system-design study. Three of the four services carry a healthcheck (the worker exposes readiness through its startup retry logic). Every state transition uses an atomic compare-and-swap guard. Every infrastructure failure mode has a documented fallback. The design decisions and their trade-offs are recorded in `discussion.md` in this repository.
 
 ---
 
@@ -69,7 +69,7 @@ SQLite is the source of truth. Redis is a queue transport with AOF persistence, 
 - Optional: an NVIDIA GPU with `nvidia-container-toolkit` installed for hardware-accelerated Ollama inference
 - Optional: Python 3.11+ with `httpx` for running the benchmark client from the host
 
-The default `MOCK_MODE=true` stack needs no GPU and no model download. It works offline.
+The default `MOCK_MODE=true` stack needs no GPU and no model download (first-run Docker image pulls still require network).
 
 ---
 
@@ -111,7 +111,7 @@ curl http://localhost:8000/status/<task_id>
 | --- | --- | --- | --- |
 | `/generate` | POST | Submit an async LLM request | `202` with `task_id` and `status_url` |
 | `/status/{task_id}` | GET | Poll task state | `200` with status and, on success, the result |
-| `/generate-sync` | POST | Synchronous baseline (blocks) | `200` with the result, or `503` when overloaded |
+| `/generate-sync` | POST | Synchronous baseline (blocks) | `200` with the result, or `503` on backend failure |
 | `/health` | GET | Infrastructure status | `200` with `redis` and `db` connection state |
 
 ### POST /generate
@@ -148,7 +148,7 @@ curl -X POST http://localhost:8000/generate-sync \
   -d '{"prompt":"Hello"}'
 ```
 
-This endpoint blocks until inference completes. It exists only as the benchmark baseline. Under concurrent load it returns `503` or drops connections; all non-200 responses count as failures in the benchmark.
+This endpoint blocks until inference completes. It exists only as the benchmark baseline. It returns `503` on backend failure; under thread-pool saturation the client observes connection errors or timeouts, all of which the benchmark counts as failures.
 
 ---
 
@@ -202,7 +202,7 @@ python benchmark/plot.py
 
 This produces `benchmark/benchmark_results.png` (1200 x 800, 150 DPI): a dual-panel chart with drop rate on top and P99 latency below, async in blue circles (dashed) against sync in red squares (solid). Line styles differ as well as colors, so the chart stays readable in grayscale. If one results file is missing, the available series still renders; if both are missing, the script exits with instructions.
 
-> Placeholder: this graph is a real measurement artifact. Run the benchmark against a live stack, then run `plot.py`, and the finished chart belongs here. A mock-data sample renders instantly but a real run is the deliverable for the thesis write-up.
+> **Status:** no benchmark artifacts are committed yet. Run the benchmark against a live stack (`run.sh` / the two `run.py` commands above), then run `plot.py`, and commit `results_async.json`, `results_sync.json`, and `benchmark_results.png` here. That chart is the deliverable for the thesis write-up.
 
 ---
 
@@ -256,15 +256,15 @@ docker compose exec ollama nvidia-smi
 
 **Redis as Celery broker, not state store.** The queue runs with AOF persistence (`--appendonly yes --appendfsync everysec`) so messages survive container restart. Task state lives only in SQLite. Celery's result backend is disabled.
 
-**Prefork worker pool.** Four processes, each with its own GIL, its own SQLite connection, and its own socket to Ollama. CPU-bound inference gets ~4x throughput over threads. This is why the backend interface is synchronous: prefork workers have no event loop by default.
+**Prefork worker pool.** Four processes, each with its own GIL, its own SQLite connection, and its own socket to Ollama. Prefork sidesteps the GIL for CPU-bound inference (theoretical ~4x on 4 cores; the default mock backend is deliberately I/O-idle, so the benchmark isolates queuing behavior instead). This is why the backend interface is synchronous: prefork workers have no event loop by default.
 
 **INSERT-before-push invariant.** The SQLite insert always precedes the Redis push. If the push fails, the task stays `QUEUED` and the client still gets `202`; the TTL mechanism eventually resolves it. A `task_id` that exists anywhere exists in SQLite.
 
 **Optimistic locking for every state transition.** Each transition guards on the current status (`WHERE status='QUEUED'`, `WHERE status='PROCESSING'`, `WHERE status IN ('QUEUED','PROCESSING')`). `rowcount` checks turn races into no-ops. No external locks, no background reaper, no state resurrection. `acks_late=True` re-delivers tasks after a worker crash; the atomic claim ensures only one worker executes inference.
 
-**Sync baseline on the same process.** `POST /generate-sync` blocks a uvicorn thread for the full inference duration. Under load the thread pool saturates and the server drops requests. That collapse is the measured control group, not a bug.
+**Sync baseline on the same image.** `POST /generate-sync` blocks a worker thread in the default executor (`run_in_executor` offload) for the full inference duration. Under load that bounded thread pool saturates and the server stops serving new requests. That collapse is the measured control group, not a bug.
 
-**Known ceiling: SQLite write throughput.** Beyond roughly 500 simultaneous writers, WAL write serialization pushes POST latency up. The benchmark quantifies this with the `p99_post_response_time_ms` metric instead of hiding it. Production scale would need Postgres or a dedicated state store; for this study the ceiling is documented evidence.
+**Known ceiling: SQLite write throughput.** WAL write serialization means many simultaneous writers contend behind a single write lock; the benchmark quantifies the actual degradation curve with the `p99_post_response_time_ms` metric instead of hiding it. Production scale would need Postgres or a dedicated state store; for this study the ceiling is documented evidence.
 
 ---
 
