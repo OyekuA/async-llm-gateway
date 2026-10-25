@@ -2,23 +2,23 @@
 
 FastAPI, Celery, Redis, SQLite
 
-**Problem:** Synchronous LLM inference blocks server threads. Causes connection exhaustion and HTTP 504 timeouts.
+**Problem:** When an API runs LLM inference inside the request, each request holds a server thread until the model finishes. Under load the server runs out of threads and clients start seeing timeouts.
 
-**Solution:** Engineered a non-blocking API gateway. Offloaded payloads into a Redis-backed Celery queue for asynchronous background processing.
+**Approach:** The API saves each request, puts it on a Redis-backed Celery queue and returns straight away. Background workers run the model and write the result back, and the client polls for it.
 
-**Impact:** Inference is fully off the request path: the API returns `202` after a single indexed SQLite insert, regardless of backend load. A ramped-concurrency benchmark (10-500) measures drop rate, P50/P95/P99 latency, and throughput for both the async path and a synchronous baseline. Results are produced by running the included benchmark (see Benchmarking).
+**What's here:** The API returns `202` after one SQLite insert and a queue push, without waiting for inference. A synchronous endpoint is kept as a baseline, and a benchmark client ramps from 10 to 500 concurrent requests against both and records drop rate, P50/P95/P99 latency and throughput (see Benchmarking).
 
 ---
 
-## Abstract
+## Overview
 
-This repository implements a containerized asynchronous gateway for LLM inference. It separates request acceptance from model execution. A client submits a prompt and receives a `task_id` immediately. Background workers perform the inference and persist the result to SQLite. The client polls a status endpoint until the task reaches a terminal state.
+This repository implements a containerized asynchronous gateway for LLM inference. It separates accepting a request from running the model. A client submits a prompt and gets a `task_id` back immediately. Background workers run the inference and save the result to SQLite. The client polls a status endpoint until the task reaches a final state.
 
-The gateway is built on four containers. FastAPI accepts HTTP requests. Redis transports task identifiers between the API and a Celery worker pool. SQLite stores the full task state machine. Ollama (or a stochastic mock backend) executes the model call.
+The gateway runs as four containers. FastAPI accepts HTTP requests. Redis carries task IDs from the API to a Celery worker pool. SQLite stores the task state. Ollama (or a mock backend that sleeps for a random interval) runs the model call.
 
-A synchronous baseline endpoint ships alongside the async path. Both ship in the same container image with identical configuration; the only architectural difference is the queuing path. The benchmark suite compares the two under identical load profiles. It measures drop rate, latency percentiles, and throughput at five concurrency levels. The async path is expected to hold near-zero drop rate at 500 concurrent requests. The sync path is expected to saturate its bounded executor thread pool under load; its collapse point is a measured output of the benchmark, not a fixed number.
+A synchronous baseline endpoint ships in the same container image. It runs the model inside the request, on the API's thread pool. Note that the two paths do not have the same capacity: the async path is limited to 4 Celery worker processes, while the sync path can use every thread in the API's thread pools. Keep that in mind when reading benchmark results.
 
-This project is a system-design study. Three of the four services carry a healthcheck (the worker exposes readiness through its startup retry logic). Every state transition uses an atomic compare-and-swap guard. Every infrastructure failure mode has a documented fallback. The design decisions and their trade-offs are recorded in `discussion.md` in this repository.
+Every state change is guarded by the task's current status, so races between workers and timeouts turn into no-ops instead of overwriting each other. Known limitations are listed at the end of the Architecture decisions section.
 
 ---
 
@@ -53,12 +53,12 @@ graph TD
 ### Request lifecycle
 
 1. Client posts a prompt to `POST /generate`.
-2. The API validates the body, inserts a `QUEUED` row into SQLite, then pushes the `task_id` onto the Redis queue. The insert happens before the push. A task that exists anywhere exists in SQLite.
-3. A prefork worker pops the `task_id` and claims it with an atomic update: `UPDATE tasks SET status='PROCESSING' WHERE task_id=? AND status='QUEUED'`. A zero-row result means the task was already claimed or expired, so the worker aborts without calling the model.
+2. The API validates the body, inserts a `QUEUED` row into SQLite, then pushes the `task_id` onto the Redis queue. The insert always happens before the push, so any task that exists in the queue also exists in SQLite.
+3. A prefork worker pops the `task_id` and claims it with an atomic update: `UPDATE tasks SET status='PROCESSING' WHERE task_id=? AND status='QUEUED'`. A zero-row result means the task was already claimed or has expired, so the worker stops without calling the model.
 4. The worker calls the backend (mock sleep, or Ollama over HTTP) and writes the result: `UPDATE tasks SET status='SUCCESS' ... WHERE task_id=? AND status='PROCESSING'`. A zero-row result means the API already marked the task `TIMEOUT`, and the result is dropped.
-5. The client polls `GET /status/{task_id}` until it sees `SUCCESS`, `FAILURE`, or `TIMEOUT`.
+5. The client polls `GET /status/{task_id}` until it sees `SUCCESS`, `FAILURE` or `TIMEOUT`.
 
-SQLite is the source of truth. Redis is a queue transport with AOF persistence, not a state store. Celery runs without a result backend; all state transitions are explicit SQL writes.
+SQLite is the source of truth. Redis is only the queue (with AOF persistence), not a state store. Celery runs without a result backend; every state change is an explicit SQL write.
 
 ---
 
@@ -66,20 +66,22 @@ SQLite is the source of truth. Redis is a queue transport with AOF persistence, 
 
 - Docker 20.10 or newer, with Docker Compose v2
 - 4 GB free RAM for the default stack
-- Optional: an NVIDIA GPU with `nvidia-container-toolkit` installed for hardware-accelerated Ollama inference
-- Optional: Python 3.11+ with `httpx` for running the benchmark client from the host
+- Optional: an NVIDIA GPU with `nvidia-container-toolkit` installed for GPU-accelerated Ollama inference
+- Optional: Python 3.11+ with `httpx` (and `matplotlib` for the graph) for running the benchmark from the host
 
-The default `MOCK_MODE=true` stack needs no GPU and no model download (first-run Docker image pulls still require network).
+The default `MOCK_MODE=true` stack needs no GPU and no model download. The Ollama container still starts, because the worker waits for it to be healthy. First-run Docker image pulls need network access.
 
 ---
 
 ## Quick start
 
+On a machine without an NVIDIA GPU, first comment out the `runtime: nvidia` line in `docker-compose.yml` (see GPU passthrough).
+
 ```bash
 docker compose up --build
 ```
 
-The API is reachable at `http://localhost:8000` once all three services report healthy. Verify:
+The API is reachable at `http://localhost:8000` once the services report healthy. Verify:
 
 ```bash
 curl http://localhost:8000/health
@@ -122,7 +124,7 @@ curl -X POST http://localhost:8000/generate \
   -d '{"prompt":"Explain quantum computing","temperature":0.7,"max_tokens":256,"model":"tinyllama"}'
 ```
 
-Validation failures return `422`. An unreachable task database returns `503`. Redis being down does not fail the request: the row is inserted, the enqueue is skipped with a logged warning, and the API still returns `202`.
+Validation failures return `422`. An unreachable task database returns `503`. If Redis is down the request does not fail: the row is inserted, the enqueue is skipped with a logged warning, and the API still returns `202`. The task stays `QUEUED` until it times out.
 
 ### GET /status/{task_id}
 
@@ -136,7 +138,7 @@ curl http://localhost:8000/status/<task_id>
 | `PROCESSING` | A worker claimed it and is running inference |
 | `SUCCESS` | Done; `result` carries `generated_text`, `total_time_ms`, `tokens_generated`, `tokens_per_second` |
 | `FAILURE` | Backend error; `error` holds the message, `retryable` says whether resubmitting is safe |
-| `TIMEOUT` | Exceeded `TASK_TTL` while `QUEUED` or `PROCESSING`; terminal |
+| `TIMEOUT` | Exceeded `TASK_TTL` while `QUEUED` or `PROCESSING`; final |
 
 Unknown `task_id` returns `404`.
 
@@ -148,40 +150,42 @@ curl -X POST http://localhost:8000/generate-sync \
   -d '{"prompt":"Hello"}'
 ```
 
-This endpoint blocks until inference completes. It exists only as the benchmark baseline. It returns `503` on backend failure; under thread-pool saturation the client observes connection errors or timeouts, all of which the benchmark counts as failures.
+This endpoint blocks until inference completes and exists only as the benchmark baseline. It returns `503` on backend failure. When all threads are busy, new requests wait for a free thread, and requests that wait too long show up as client timeouts, which the benchmark counts as failures.
 
 ---
 
 ## Client guidance
 
-- Poll `GET /status/{task_id}` every 200-500 ms. Faster polling creates read pressure on SQLite for no latency gain.
-- Treat 120 seconds as the per-task ceiling. Beyond that, assume the worker crashed or the task was lost.
-- Tasks stuck past `TASK_TTL` (default 300 s) transition to `TIMEOUT` on the next poll. This is a lazy update: the row is mutated, not virtually reported, so a late worker result cannot resurrect the task.
-- On `FAILURE`, inspect `retryable`. Resubmit only when it is `true`.
+- Poll `GET /status/{task_id}` every 200-500 ms. Faster polling adds read load on SQLite without lowering latency.
+- The benchmark treats a task as failed if it hasn't finished within 120 seconds (`--timeout`).
+- Tasks still `QUEUED` or `PROCESSING` after `TASK_TTL` (default 300 s, counted from creation) are marked `TIMEOUT` on the next poll. The row itself is updated, so a late worker result cannot bring the task back.
+- On `FAILURE`, check `retryable`. Resubmit only when it is `true`.
 
 ---
 
 ## Benchmarking
 
-The benchmark drives ramped concurrent requests against both endpoints and writes machine-readable results after each concurrency level. A crash mid-run preserves every completed level.
+The benchmark sends ramped concurrent requests to one endpoint per run and writes results to a JSON file after each concurrency level, so a crash mid-run keeps every completed level.
 
 ### Prerequisites
 
 ```bash
-pip install httpx   # host-side client; matplotlib only if you generate graphs
+pip install httpx matplotlib
 ```
 
 ### Async run
 
 ```bash
-python benchmark/run.py --mode async --concurrency 10 50 100 200 500
+python benchmark/run.py --mode async --concurrency 10 50 100 200 500 --output benchmark/results_async.json
 ```
 
 ### Sync baseline run
 
 ```bash
-python benchmark/run.py --mode sync --concurrency 10 50 100 200 500
+python benchmark/run.py --mode sync --concurrency 10 50 100 200 500 --output benchmark/results_sync.json
 ```
+
+Pass `--output` on both runs. The default output file is the same for both modes, so without it the second run overwrites the first.
 
 ### Flags
 
@@ -190,9 +194,9 @@ python benchmark/run.py --mode sync --concurrency 10 50 100 200 500
 | `--target` | `http://localhost:8000` | Base URL of the gateway |
 | `--concurrency` | `10 50 100 200 500` | Concurrency levels, run in order |
 | `--mode` | required | `async` or `sync` |
-| `--output` | `benchmark/results.json` | Results file (incremental writes) |
+| `--output` | `benchmark/results.json` | Results file (written after each level) |
 | `--poll-interval` | `200` | ms between status polls |
-| `--timeout` | `120` | seconds before a task counts as timed out |
+| `--timeout` | `120` | seconds before a task counts as failed |
 
 ### Graph
 
@@ -200,9 +204,15 @@ python benchmark/run.py --mode sync --concurrency 10 50 100 200 500
 python benchmark/plot.py
 ```
 
-This produces `benchmark/benchmark_results.png` (1200 x 800, 150 DPI): a dual-panel chart with drop rate on top and P99 latency below, async in blue circles (dashed) against sync in red squares (solid). Line styles differ as well as colors, so the chart stays readable in grayscale. If one results file is missing, the available series still renders; if both are missing, the script exits with instructions.
+This reads `benchmark/results_async.json` and `benchmark/results_sync.json` and produces `benchmark/benchmark_results.png` (1200 x 800, 150 DPI): drop rate on top and P99 latency below, async in blue circles (dashed) and sync in red squares (solid). If one results file is missing, the available series still renders; if both are missing, the script exits with instructions.
 
-> **Status:** no benchmark artifacts are committed yet. Run the benchmark against a live stack (`run.sh` / the two `run.py` commands above), then run `plot.py`, and commit `results_async.json`, `results_sync.json`, and `benchmark_results.png` here. That chart is the deliverable for the thesis write-up.
+### Reading the results
+
+- In mock mode each task takes 2-6 s and the async path has 4 workers, so it completes roughly one task per second. At high concurrency, tasks near the back of the queue can pass the 120 s client timeout and count as dropped even though the API accepted them.
+- The sync path runs on the API's thread pools, which hold more requests at once than 4 workers, so it may complete more requests in mock mode.
+- The async path's main difference is how fast requests are accepted. That is recorded per level as `p99_post_response_time_ms` in the async results file; it is not plotted.
+
+> **Status:** benchmark results are not committed yet.
 
 ---
 
@@ -210,20 +220,20 @@ This produces `benchmark/benchmark_results.png` (1200 x 800, 150 DPI): a dual-pa
 
 | Setting | Behavior |
 | --- | --- |
-| `MOCK_MODE=true` (default) | Worker sleeps a uniform 2-6 s and returns canned text. No GPU, no model download, deterministic delay envelope. |
-| `MOCK_MODE=false` | Worker connects to Ollama at `OLLAMA_URL`. On first use it polls `/api/tags`, pulls `DEFAULT_MODEL` if missing (streaming progress logs), then runs inference through the HTTP API. |
+| `MOCK_MODE=true` (default) | Worker sleeps a random 2-6 s and returns canned text. No GPU, no model download. |
+| `MOCK_MODE=false` | Worker connects to Ollama at `OLLAMA_URL`. On first use it checks `/api/tags`, pulls `DEFAULT_MODEL` if missing (with progress logs), then runs inference through the HTTP API. |
 
-`MOCK_FAILURE_RATE` (float 0.0-1.0) makes the mock backend raise `LLMBackendError("Simulated OOM")` with that probability, which exercises the FAILURE path and the `retryable` flag without touching real infrastructure.
+`MOCK_FAILURE_RATE` (0.0-1.0) makes the mock backend raise `LLMBackendError("Simulated OOM")` with that probability, which exercises the `FAILURE` path and the `retryable` flag.
 
 ---
 
 ## GPU passthrough
 
-The Ollama container uses `runtime: nvidia` in `docker-compose.yml`. This requires `nvidia-container-toolkit` on the host. Without it, the Docker daemon rejects the compose file.
+The Ollama container uses `runtime: nvidia` in `docker-compose.yml`. This requires `nvidia-container-toolkit` on the host. Without it, Docker rejects the compose file.
 
-On a CPU-only host, comment out the `runtime: nvidia` line (the compose file carries the note) or use a compose override. Ollama then runs on CPU: slower, but fully functional.
+On a CPU-only host, comment out the `runtime: nvidia` line (the compose file has a note) or use a compose override. Ollama then runs on CPU: slower, but it works.
 
-Two mechanisms are deliberately absent. `deploy.resources` is Swarm-only and silently ignored by `docker compose up`. `NVIDIA_VISIBLE_DEVICES` is the legacy `nvidia-docker2` approach. `runtime: nvidia` alone is the modern, sufficient mechanism.
+`deploy.resources` is not used because `docker compose up` ignores it outside Swarm, and `NVIDIA_VISIBLE_DEVICES` is the older `nvidia-docker2` approach. `runtime: nvidia` is enough on its own.
 
 Verify with:
 
@@ -242,9 +252,9 @@ docker compose exec ollama nvidia-smi
 | `OLLAMA_URL` | `http://ollama:11434` | Ollama HTTP API base |
 | `MOCK_MODE` | `true` | Use the mock backend (no GPU needed) |
 | `MOCK_FAILURE_RATE` | `0.0` | Probability the mock backend raises a simulated failure |
-| `TASK_TTL` | `300` | Seconds before a stale task is marked `TIMEOUT` |
+| `TASK_TTL` | `300` | Seconds after creation before an unfinished task is marked `TIMEOUT` |
 | `VALID_MODELS` | `tinyllama,llama3,llama3:8b` | Allowlist checked by the API when `MOCK_MODE=false` |
-| `DEFAULT_MODEL` | `tinyllama` | Model pulled on first Ollama startup and used for routing |
+| `DEFAULT_MODEL` | `tinyllama` | Model pulled on first Ollama startup, and used when a request doesn't name one |
 | `MODEL_PULL_TIMEOUT` | `600` | Max seconds to wait for a model download |
 | `LOG_LEVEL` | `info` | Logging verbosity |
 
@@ -252,19 +262,24 @@ docker compose exec ollama nvidia-smi
 
 ## Architecture decisions
 
-**SQLite with WAL mode for task state.** Zero infrastructure, one file, shareable through a Docker volume. WAL permits concurrent readers with a single serialized writer. `busy_timeout=5000` waits out transient contention, and a retry wrapper (5 attempts, 100 ms to 1.6 s backoff) catches the rest. The API uses `aiosqlite` so the event loop never blocks on disk I/O; prefork workers use plain `sqlite3`.
+**SQLite with WAL mode for task state.** No extra service, one file, shared between containers through a Docker volume. WAL allows concurrent readers with one writer at a time. `busy_timeout=5000` waits out short contention, and a retry wrapper (5 attempts, 100 ms to 1.6 s backoff) handles the rest. The API uses `aiosqlite` so database calls don't block the event loop; the prefork workers use plain `sqlite3`.
 
-**Redis as Celery broker, not state store.** The queue runs with AOF persistence (`--appendonly yes --appendfsync everysec`) so messages survive container restart. Task state lives only in SQLite. Celery's result backend is disabled.
+**Redis as the Celery broker, not a state store.** The queue runs with AOF persistence (`--appendonly yes --appendfsync everysec`) so queued messages survive a Redis restart. Task state lives only in SQLite, and Celery's result backend is disabled.
 
-**Prefork worker pool.** Four processes, each with its own GIL, its own SQLite connection, and its own socket to Ollama. Prefork sidesteps the GIL for CPU-bound inference (theoretical ~4x on 4 cores; the default mock backend is deliberately I/O-idle, so the benchmark isolates queuing behavior instead). This is why the backend interface is synchronous: prefork workers have no event loop by default.
+**Prefork worker pool.** Four worker processes, each handling one task at a time with its own SQLite connection. The model itself runs in Ollama, so a worker mostly waits on an HTTP call. Prefork processes have no event loop by default, which is why the backend interface is synchronous. Async throughput is therefore capped at 4 tasks in flight.
 
-**INSERT-before-push invariant.** The SQLite insert always precedes the Redis push. If the push fails, the task stays `QUEUED` and the client still gets `202`; the TTL mechanism eventually resolves it. A `task_id` that exists anywhere exists in SQLite.
+**Insert before push.** The SQLite insert always happens before the Redis push. If the push fails, the task stays `QUEUED`, the client still gets `202`, and the task is marked `TIMEOUT` once `TASK_TTL` passes.
 
-**Optimistic locking for every state transition.** Each transition guards on the current status (`WHERE status='QUEUED'`, `WHERE status='PROCESSING'`, `WHERE status IN ('QUEUED','PROCESSING')`). `rowcount` checks turn races into no-ops. No external locks, no background reaper, no state resurrection. `acks_late=True` re-delivers tasks after a worker crash; the atomic claim ensures only one worker executes inference.
+**Status-guarded updates for every state change.** Each update checks the current status (`WHERE status='QUEUED'`, `WHERE status='PROCESSING'`, `WHERE status IN ('QUEUED','PROCESSING')`) and checks `rowcount`, so races become no-ops. There are no external locks and no background cleanup job; timeouts are applied when a client polls.
 
-**Sync baseline on the same image.** `POST /generate-sync` blocks a worker thread in the default executor (`run_in_executor` offload) for the full inference duration. Under load that bounded thread pool saturates and the server stops serving new requests. That collapse is the measured control group, not a bug.
+**Sync baseline on the same image.** `POST /generate-sync` runs the model call on the API's default thread pool (`run_in_executor`) and holds that thread for the full inference. When every thread is busy, new requests wait. That behavior is what the baseline is there to measure.
 
-**Known ceiling: SQLite write throughput.** WAL write serialization means many simultaneous writers contend behind a single write lock; the benchmark quantifies the actual degradation curve with the `p99_post_response_time_ms` metric instead of hiding it. Production scale would need Postgres or a dedicated state store; for this study the ceiling is documented evidence.
+**Known limitations**
+
+- **Worker crash mid-task.** Tasks use `acks_late=True`, so a task is redelivered if its worker dies. But the claim only succeeds on `QUEUED` rows, and a crashed task is already `PROCESSING`, so the redelivered task is skipped. The task stays `PROCESSING` until `TASK_TTL` passes and is then marked `TIMEOUT`. It is not re-run.
+- **Enqueue blocks the event loop briefly.** `send_task` is a synchronous call inside the async endpoint. It is normally fast, but when Redis is unreachable it can block the event loop while Celery's publish retries run.
+- **A new SQLite connection per request.** Each request opens a connection and re-runs the schema and WAL checks. It's simple but adds overhead.
+- **SQLite write throughput.** WAL allows one writer at a time, so many simultaneous writes queue behind that lock. Production use would need Postgres or a dedicated state store.
 
 ---
 
@@ -276,18 +291,18 @@ docker compose exec ollama nvidia-smi
 ├── common/         Shared SQLite layer (sync + async), JSON logging
 ├── benchmark/      run.py (load driver), plot.py (dual-panel graph)
 ├── tests/          API tests (no Docker) + integration suite (Docker, auto-skipped)
-├── docs/           Generated artifacts (architecture diagram)
+├── docs/           Architecture diagram
 └── docker-compose.yml, Dockerfile, .env.example
 ```
 
 ## Verification
 
-The no-Docker suite runs without any infrastructure:
+These run without Docker:
 
 ```bash
-py -m pytest tests/ -q          # 5 API tests pass, 7 Docker tests skip
-py test_db_init.py              # schema, WAL, busy_timeout, retry wrapper
-py test_concurrent_inserts.py   # 750 concurrent inserts, zero locked errors
+python -m pytest tests/ -q          # 5 API tests pass, 7 Docker tests skip
+python test_db_init.py              # schema, WAL, busy_timeout, retry wrapper
+python test_concurrent_inserts.py   # 750 inserts in batches of 50, 200 and 500 concurrent threads, zero lock errors
 ```
 
-The Docker integration suite (happy path, worker failure, Redis-down resilience, 404, 422, idle expiry, TIMEOUT race) runs under `pytest tests/test_integration.py` on a host with Docker, and skips cleanly without it.
+The Docker integration suite (happy path, worker failure, Redis down, 404, 422, idle expiry, timeout race) runs with `pytest tests/test_integration.py` on a host with Docker, and skips without it.
